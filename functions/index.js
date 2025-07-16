@@ -331,3 +331,105 @@ exports.processMatches = onRequest({ timeoutSeconds: 300, memory: '1GiB' }, asyn
         return res.status(500).json({ status: "error", message: error.message });
     }
 });
+
+/**
+ * Processes the ranked matches for a given day to create stable couples.
+ * This function should run AFTER 'processMatches' has completed.
+ * It uses a greedy algorithm based on mutual scores.
+ */
+exports.createCouplesFromMatches = onRequest({ timeoutSeconds: 300, memory: '1GiB' }, async (req, res) => {
+    try {
+        // --- 1. Get the Document ID for the day (same logic as in processMatches) ---
+        const today = new Date();
+        const dateDocumentId = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const dateDocRef = db.collection('matches').doc(dateDocumentId);
+        const couplesDocRef = db.collection('couples').doc(dateDocumentId);
+
+        const docSnap = await dateDocRef.get();
+        if (!docSnap.exists) {
+            return res.status(404).json({
+                status: "error",
+                message: `Match document for ${dateDocumentId} not found. Run processMatches first.`,
+            });
+        }
+
+        const dailyMatchesData = docSnap.data();
+
+        // --- 2. Create a master list of all potential pairings with mutual scores ---
+        const allPotentialPairs = [];
+        const checkedPairs = new Set(); // To avoid adding both [A,B] and [B,A]
+
+        for (const userIdA in dailyMatchesData) {
+            const userAMatches = dailyMatchesData[userIdA].matches || [];
+
+            for (const match of userAMatches) {
+                const userIdB = match.uuid;
+                const scoreAtoB = match.score;
+
+                // Ensure we don't process the same pair twice (e.g., A->B and B->A)
+                const pairKey = [userIdA, userIdB].sort().join('-');
+                if (checkedPairs.has(pairKey)) {
+                    continue;
+                }
+                checkedPairs.add(pairKey);
+
+                // Find the score from B to A
+                const userBMatches = dailyMatchesData[userIdB]?.matches || [];
+                const matchFromBtoA = userBMatches.find(m => m.uuid === userIdA);
+                const scoreBtoA = matchFromBtoA ? matchFromBtoA.score : 0;
+
+                const mutualScore = scoreAtoB + scoreBtoA;
+
+                if (mutualScore > 0) {
+                    allPotentialPairs.push({
+                        pair: [userIdA, userIdB],
+                        mutualScore: mutualScore,
+                    });
+                }
+            }
+        }
+
+        // --- 3. Sort the master list by the highest mutual score ---
+        allPotentialPairs.sort((a, b) => b.mutualScore - a.mutualScore);
+
+
+        // --- 4. Iterate and form couples, creating a map ---
+        const matchedUsers = new Set();
+        const finalCouplesMap = {};
+
+        for (const potentialPair of allPotentialPairs) {
+            const [user1, user2] = potentialPair.pair;
+
+            // If neither user is already matched, form the couple
+            if (!matchedUsers.has(user1) && !matchedUsers.has(user2)) {
+                const mutualScore = potentialPair.mutualScore;
+
+                finalCouplesMap[user1] = { partnerId: user2, mutualScore };
+                finalCouplesMap[user2] = { partnerId: user1, mutualScore };
+
+                matchedUsers.add(user1);
+                matchedUsers.add(user2);
+            }
+        }
+
+        // --- 5. Save the final couples map to Firestore ---
+        // ✅ FIX: Using .set() to create the document if it doesn't exist.
+        await couplesDocRef.set({
+            couples: finalCouplesMap,
+            couplingCompletedAt: new Date().toISOString(),
+        });
+
+        // ✅ FIX: Correctly calculating the number of couples formed.
+        const numberOfCouples = matchedUsers.size / 2;
+
+        return res.status(200).json({
+            status: "success",
+            message: `Successfully created ${numberOfCouples} couples.`,
+            dateDocumentId: dateDocumentId,
+        });
+
+    } catch (error) {
+        console.error("Coupling error:", error);
+        return res.status(500).json({ status: "error", message: error.message });
+    }
+});
