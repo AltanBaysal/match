@@ -1,17 +1,19 @@
 // functions/index.js
-const { onRequest } = require("firebase-functions/v2/https"); // ✅ Correct
+const { onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+const ngeohash = require('ngeohash');
 
 admin.initializeApp();
 const db = admin.firestore();
 
-// --- Configuration for Scoring ---
-// Puan etkilerini dinamik olarak dışarıdan almak için yapılandırma.
-// Bu obje, "yumuşak" tercihlerin puanlarını merkezi bir yerden yönetmeyi sağlar.
+// --- Configuration ---
+// Kullanıcının kendi lokasyonunun hangi hassasiyette saklanacağı. Yüksek olması iyidir.
+const USER_LOCATION_PRECISION = 9; // ~76 x 76 metrelik bir hassasiyet.
+
 const scoringConfig = {
     children: {
-        mismatchPenalty: -40, // B'nin çocuğu var, A'nın yok
-        sameStatusBonus: 10,  // İkisinin de var veya ikisinin de yok
+        mismatchPenalty: -40,
+        sameStatusBonus: 10,
     },
     wantsChildren: {
         similarBonus: 15,
@@ -26,7 +28,7 @@ const scoringConfig = {
     religion: {
         similarBonus: 8,
     },
-    height: { // Boy farkı azaldıkça verilecek puan
+    height: {
         maxBonus: 10,
         minBonus: 5,
     },
@@ -41,32 +43,39 @@ const scoringConfig = {
         voicePromptBonus: 8,
     },
     substanceUse: {
-        // A kullanmıyor, B kullanıyor durumu için ceza puanı
         mismatchPenalty: -15,
-        // İkisi de birebir aynı alışkanlığa sahipse (ikisi de hiç / ikisi de sosyal vb.)
         exactMatchBonus: 10,
-        // İkisi de kullanıyor ama sıklıkları farklıysa (biri sosyal, biri sık)
         closeMatchBonus: 5,
     },
     hometown: {
         sameBonus: 5,
     },
     interests: {
-        perInterestBonus: 10, // Ortak her ilgi alanı için puan
-        maxBonus: 50,         // İlgi alanlarından kazanılabilecek maksimum puan
+        perInterestBonus: 10,
+        maxBonus: 50,
     }
 };
 
+// --- Helper Functions ---
+
+const toRad = (deg) => deg * Math.PI / 180;
 
 /**
- * Calculates the distance in kilometers between two geographical points.
- * @param {object} loc1 - Location object with {lat, lon}.
- * @param {object} loc2 - Location object with {lat, lon}.
- * @returns {number} Distance in km.
+ * ✅ YENİ: Kullanıcının arama mesafesine göre dinamik Geohash hassasiyeti belirler.
+ * @param {number} distanceKm Kullanıcının arama mesafesi tercihi (km).
+ * @returns {number} Geohash hassasiyet seviyesi (1-12).
  */
+function getPrecisionForDistance(distanceKm) {
+    if (distanceKm <= 2) return 6;
+    if (distanceKm <= 10) return 5;
+    if (distanceKm <= 40) return 4;
+    if (distanceKm <= 320) return 3;
+    return 1;
+}
+
+
 function calculateDistance(loc1, loc2) {
-    const R = 6371; // Earth's radius in km
-    const toRad = (deg) => deg * Math.PI / 180;
+    const R = 6371;
     const dLat = toRad(loc2.lat - loc1.lat);
     const dLon = toRad(loc2.lon - loc1.lon);
     const a = Math.sin(dLat / 2) ** 2
@@ -76,74 +85,45 @@ function calculateDistance(loc1, loc2) {
     return R * c;
 }
 
-/**
- * Checks for "Hard" compatibility issues that would disqualify a match.
- * These are non-negotiable deal-breakers.
- * @param {object} userA - The user for whom we are finding matches.
- * @param {object} userB - The potential match.
- * @returns {boolean} - True if compatible, false if not.
- */
-function checkCompatibility(userA, userB) {
-    const prefsA = userA.preferences;
-
-    // 1. Gender check
-    if (prefsA.gender !== userB.gender) {
-        return false;
-    }
-
-    // 2. Age range check
-    if (userB.age < prefsA.minAge || userB.age > prefsA.maxAge) {
-        return false;
-    }
-
-    // 3. Distance check
-    const distance = calculateDistance(userA.location, userB.location);
-    if (distance > prefsA.maxDistance) {
-        return false;
-    }
-
-    // 4. Substance Use (Hard Filters)
-    // A uyuşturucu kullanmayan birini arıyor ve B kullanıyorsa
-    if (prefsA.drugPolicy === 'never' && userB.usesDrugs) {
-        return false;
-    }
-    // A, "kesinlikle alkol kullanmamalı" diyor ve B kullanıyorsa
-    if (prefsA.alcoholPolicy === 'never' && userB.alcoholFrequency !== 'never') {
-        return false;
-    }
-    // A, "kesinlikle sigara kullanmamalı" diyor ve B kullanıyorsa
-    if (prefsA.smokingPolicy === 'never' && userB.smokingFrequency !== 'never') {
-        return false;
-    }
-
-    return true;
+function getBoundingBox(latitude, longitude, distanceKm) {
+    const R = 6371;
+    const latRad = toRad(latitude);
+    const latDelta = distanceKm / R;
+    const lonDelta = distanceKm / (R * Math.cos(latRad));
+    const minLat = latitude - latDelta * (180 / Math.PI);
+    const maxLat = latitude + latDelta * (180 / Math.PI);
+    const minLon = longitude - lonDelta * (180 / Math.PI);
+    const maxLon = longitude + lonDelta * (180 / Math.PI);
+    return { minLat, minLon, maxLat, maxLon };
 }
 
 
-/**
- * Calculates a compatibility score based on "soft" preferences.
- * @param {object} scorer - The user for whom we are calculating the score.
- * @param {object} target - The user being scored.
- * @returns {number} - The compatibility score.
- */
+function checkCompatibility(userA, userB) {
+    const prefsA = userA.preferences;
+    if (prefsA.gender !== userB.gender) return false;
+    if (userB.age < prefsA.minAge || userB.age > prefsA.maxAge) return false;
+    const distance = calculateDistance(userA.location, userB.location);
+    if (distance > prefsA.maxDistance) return false;
+    if (prefsA.drugPolicy === 'never' && userB.usesDrugs) return false;
+    if (prefsA.alcoholPolicy === 'never' && userB.alcoholFrequency !== 'never') return false;
+    if (prefsA.smokingPolicy === 'never' && userB.smokingFrequency !== 'never') return false;
+    return true;
+}
+
 function calculateScore(scorer, target) {
     let score = 0;
     const config = scoringConfig;
-
     if (target.hasChildren && !scorer.hasChildren) {
         score += config.children.mismatchPenalty;
     } else if (target.hasChildren === scorer.hasChildren) {
         score += config.children.sameStatusBonus;
     }
-
     if (target.wantsChildren === scorer.wantsChildren) {
         score += config.wantsChildren.similarBonus;
     }
-
     if (target.politicalView && target.politicalView === scorer.politicalView) {
         score += config.politicalView.similarBonus;
     }
-
     if (target.educationLevel && scorer.educationLevel) {
         if (target.educationLevel >= scorer.educationLevel) {
             score += config.education.higherOrSameBonus.max;
@@ -151,31 +131,24 @@ function calculateScore(scorer, target) {
             score += config.education.lowerPenalty.min;
         }
     }
-
     if (target.religion && target.religion === scorer.religion) {
         score += config.religion.similarBonus;
     }
-
     const heightDiff = Math.abs(scorer.height - target.height);
     if (heightDiff < 5) score += config.height.maxBonus;
     else if (heightDiff < 10) score += config.height.minBonus;
-
     if (target.ethnicity && target.ethnicity === scorer.ethnicity) {
         score += config.ethnicity.similarBonus;
     }
-
     if (target.workplace && target.workplace === scorer.workplace) {
         score += config.workplace.sameBonus;
     }
-
     if (target.hasCompletedPrompts) score += config.profileCompletion.promptsFilledBonus;
     if (target.hasVoicePrompts) score += config.profileCompletion.voicePromptBonus;
-
     const substances = ['alcohol', 'smoking', 'marijuana'];
     substances.forEach(substance => {
         const scorerFreq = scorer[`${substance}Frequency`];
         const targetFreq = target[`${substance}Frequency`];
-
         if (scorerFreq === 'never' && targetFreq !== 'never') {
             score += config.substanceUse.mismatchPenalty;
         } else if (scorerFreq !== 'never' && targetFreq === 'never') {
@@ -188,26 +161,21 @@ function calculateScore(scorer, target) {
             }
         }
     });
-
     if (target.hometown && target.hometown === scorer.hometown) {
         score += config.hometown.sameBonus;
     }
-
-    const commonInterests = (scorer.interests || [])
-        .filter(i => (target.interests || []).includes(i));
+    const commonInterests = (scorer.interests || []).filter(i => (target.interests || []).includes(i));
     const interestScore = Math.min(config.interests.maxBonus, commonInterests.length * config.interests.perInterestBonus);
     score += interestScore;
-
     return Math.round(Math.max(0, score));
 }
 
+// --- Cloud Functions ---
 
-// 1) Rastgele kullanıcı oluşturma - Updated for new criteria!
 exports.createRandomUsers = onRequest(async (req, res) => {
     try {
         let count = parseInt(req.query.count) || 10;
         if (count > 500) count = 500;
-
         const allInterests = ['seyahat', 'spor', 'sinema', 'müzik', 'sanat', 'kitap', 'oyun', 'yemek', 'teknoloji'];
         const genders = ['male', 'female'];
         const booleans = [true, false];
@@ -217,21 +185,20 @@ exports.createRandomUsers = onRequest(async (req, res) => {
         const religions = ['Agnostic', 'Atheist', 'Muslim', 'Christian', 'Spiritual'];
         const hometowns = ['İstanbul', 'Ankara', 'İzmir', 'Bursa', 'Antalya'];
         const ethnicities = ['Turkish', 'Kurdish', 'Arab', 'Circassian'];
-
         const batch = db.batch();
-
         for (let i = 0; i < count; i++) {
             const lat = Math.random() * (41.2 - 40.9) + 40.9;
             const lon = Math.random() * (29.2 - 28.8) + 28.8;
+            const geohash = ngeohash.encode(lat, lon, USER_LOCATION_PRECISION);
             const age = Math.floor(Math.random() * 38) + 18;
             const gender = genders[Math.floor(Math.random() * genders.length)];
             const educationKeys = Object.keys(educationLevels);
-
             const docRef = db.collection('users').doc();
             batch.set(docRef, {
                 age,
                 gender,
                 location: { lat, lon },
+                geohash: geohash,
                 interests: [...allInterests].sort(() => 0.5 - Math.random()).slice(0, Math.floor(Math.random() * 4) + 2),
                 hasChildren: booleans[Math.floor(Math.random() * booleans.length)],
                 wantsChildren: booleans[Math.floor(Math.random() * booleans.length)],
@@ -257,7 +224,7 @@ exports.createRandomUsers = onRequest(async (req, res) => {
             });
         }
         await batch.commit();
-        res.status(200).send(`✅ Successfully created ${count} random users with detailed profiles.`);
+        res.status(200).send(`✅ Successfully created ${count} random users with geohash.`);
     } catch (err) {
         console.error("Error creating users:", err);
         res.status(500).send(`Error: ${err.message}`);
@@ -265,81 +232,86 @@ exports.createRandomUsers = onRequest(async (req, res) => {
 });
 
 
-exports.processMatches = onRequest({ timeoutSeconds: 300, memory: '1GiB' }, async (req, res) => {
+exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, async (req, res) => {
     try {
-        // --- 1. Create a dynamic document ID based on the current date ---
         const today = new Date();
-        const year = today.getFullYear();
-        const month = String(today.getMonth() + 1).padStart(2, '0'); // Add 1 because months are 0-indexed
-        const day = String(today.getDate()).padStart(2, '0');
-        const dateDocumentId = `${year}-${month}-${day}`; // e.g., "2025-07-16"
-
-        // Get all users from the 'users' collection
-        const usersSnap = await db.collection('users').get();
-        const users = usersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-        // Object to hold all users' matches for the current day
+        const dateDocumentId = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const allUsersSnap = await db.collection('users').get();
+        const users = allUsersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
         const dailyMatchesData = {};
 
-        // Iterate through each user to find their matches
         for (const uA of users) {
+            if (!uA.location || !uA.preferences) continue;
+            const prefsA = uA.preferences;
             const matches = [];
 
-            for (const uB of users) {
-                // Skip self-comparison
+            const searchPrecision = getPrecisionForDistance(prefsA.maxDistance);
+            const { minLat, minLon, maxLat, maxLon } = getBoundingBox(uA.location.lat, uA.location.lon, prefsA.maxDistance);
+            let searchHashes = ngeohash.bboxes(minLat, minLon, maxLat, maxLon, searchPrecision);
+
+            // Filter out the user's own precise geohash to avoid self-matching if USER_LOCATION_PRECISION is used
+            const userAGeohashAtSearchPrecision = ngeohash.encode(uA.location.lat, uA.location.lon, searchPrecision);
+            searchHashes = searchHashes.filter(hash => hash !== userAGeohashAtSearchPrecision);
+
+
+            if (searchHashes.length === 0) {
+                dailyMatchesData[uA.id] = { matches: [] };
+                continue;
+            }
+
+            // --- IMPORTANT CHANGE: Handle 'in' query limit by chunking ---
+            const BATCH_SIZE = 10; // Firestore 'in' query limit
+            const potentialMatchesDocs = [];
+
+            for (let i = 0; i < searchHashes.length; i += BATCH_SIZE) {
+                const chunk = searchHashes.slice(i, i + BATCH_SIZE);
+                const chunkQuery = db.collection('users')
+                    .where('gender', '==', prefsA.gender)
+                    .where('age', '>=', prefsA.minAge)
+                    .where('age', '<=', prefsA.maxAge)
+                    .where('geohash', 'in', chunk); // Using the chunk here
+
+                const chunkSnap = await chunkQuery.get();
+                potentialMatchesDocs.push(...chunkSnap.docs);
+            }
+            // --- END IMPORTANT CHANGE ---
+
+            for (const docB of potentialMatchesDocs) { // Iterate through all collected documents
+                const uB = { id: docB.id, ...docB.data() };
                 if (uA.id === uB.id) continue;
 
-                // Check mutual compatibility
-                if (!checkCompatibility(uA, uB) || !checkCompatibility(uB, uA)) {
-                    continue;
-                }
+                const distance = calculateDistance(uA.location, uB.location);
+                if (distance > prefsA.maxDistance) continue;
+
+                if (!checkCompatibility(uB, uA)) continue;
 
                 const score = calculateScore(uA, uB);
-
                 if (score > 0) {
                     matches.push({ uuid: uB.id, score });
                 }
             }
 
-            // Sort matches by score in descending order
             matches.sort((a, b) => b.score - a.score);
-
-            // Add this user's matches to the dailyMatchesData object
-            dailyMatchesData[uA.id] = {
-                matches: matches,
-            };
+            dailyMatchesData[uA.id] = { matches };
         }
 
-        // --- 2. Create a reference to the single document for the current date ---
-        // Path: /matches/{dateDocumentId}
         const dateDocRef = db.collection('matches').doc(dateDocumentId);
-
-        // --- 3. Use set() to create or overwrite the single date document with all users' matches ---
-        // We use set() without merge:true here to ensure the document contains only the current day's data.
-        // If you intended to append to existing data (e.g., if this function runs multiple times a day),
-        // you would need to fetch the existing document first, merge, and then set.
         await dateDocRef.set(dailyMatchesData);
 
         return res.status(200).json({
             status: "success",
-            message: `Successfully generated matches for ${users.length} users and saved under date document ID ${dateDocumentId}.`,
-            dateDocumentId: dateDocumentId,
-            generatedAt: new Date().toISOString()
+            message: `✅ Successfully generated DYNAMIC GEOHASH-based matches for ${users.length} users.`,
+            dateDocumentId: dateDocumentId
         });
     } catch (error) {
-        console.error("Matching error:", error);
+        console.error("Geohash matching error:", error);
         return res.status(500).json({ status: "error", message: error.message });
     }
 });
 
-/**
- * Processes the ranked matches for a given day to create stable couples.
- * This function should run AFTER 'processMatches' has completed.
- * It uses a greedy algorithm based on mutual scores.
- */
+
 exports.createCouplesFromMatches = onRequest({ timeoutSeconds: 300, memory: '1GiB' }, async (req, res) => {
     try {
-        // --- 1. Get the Document ID for the day (same logic as in processMatches) ---
         const today = new Date();
         const dateDocumentId = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
         const dateDocRef = db.collection('matches').doc(dateDocumentId);
@@ -352,34 +324,23 @@ exports.createCouplesFromMatches = onRequest({ timeoutSeconds: 300, memory: '1Gi
                 message: `Match document for ${dateDocumentId} not found. Run processMatches first.`,
             });
         }
-
         const dailyMatchesData = docSnap.data();
-
-        // --- 2. Create a master list of all potential pairings with mutual scores ---
         const allPotentialPairs = [];
-        const checkedPairs = new Set(); // To avoid adding both [A,B] and [B,A]
-
+        const checkedPairs = new Set();
         for (const userIdA in dailyMatchesData) {
             const userAMatches = dailyMatchesData[userIdA].matches || [];
-
             for (const match of userAMatches) {
                 const userIdB = match.uuid;
                 const scoreAtoB = match.score;
-
-                // Ensure we don't process the same pair twice (e.g., A->B and B->A)
                 const pairKey = [userIdA, userIdB].sort().join('-');
                 if (checkedPairs.has(pairKey)) {
                     continue;
                 }
                 checkedPairs.add(pairKey);
-
-                // Find the score from B to A
                 const userBMatches = dailyMatchesData[userIdB]?.matches || [];
                 const matchFromBtoA = userBMatches.find(m => m.uuid === userIdA);
                 const scoreBtoA = matchFromBtoA ? matchFromBtoA.score : 0;
-
                 const mutualScore = scoreAtoB + scoreBtoA;
-
                 if (mutualScore > 0) {
                     allPotentialPairs.push({
                         pair: [userIdA, userIdB],
@@ -388,46 +349,29 @@ exports.createCouplesFromMatches = onRequest({ timeoutSeconds: 300, memory: '1Gi
                 }
             }
         }
-
-        // --- 3. Sort the master list by the highest mutual score ---
         allPotentialPairs.sort((a, b) => b.mutualScore - a.mutualScore);
-
-
-        // --- 4. Iterate and form couples, creating a map ---
         const matchedUsers = new Set();
         const finalCouplesMap = {};
-
         for (const potentialPair of allPotentialPairs) {
             const [user1, user2] = potentialPair.pair;
-
-            // If neither user is already matched, form the couple
             if (!matchedUsers.has(user1) && !matchedUsers.has(user2)) {
                 const mutualScore = potentialPair.mutualScore;
-
                 finalCouplesMap[user1] = { partnerId: user2, mutualScore };
                 finalCouplesMap[user2] = { partnerId: user1, mutualScore };
-
                 matchedUsers.add(user1);
                 matchedUsers.add(user2);
             }
         }
-
-        // --- 5. Save the final couples map to Firestore ---
-        // ✅ FIX: Using .set() to create the document if it doesn't exist.
         await couplesDocRef.set({
             couples: finalCouplesMap,
             couplingCompletedAt: new Date().toISOString(),
         });
-
-        // ✅ FIX: Correctly calculating the number of couples formed.
         const numberOfCouples = matchedUsers.size / 2;
-
         return res.status(200).json({
             status: "success",
             message: `Successfully created ${numberOfCouples} couples.`,
             dateDocumentId: dateDocumentId,
         });
-
     } catch (error) {
         console.error("Coupling error:", error);
         return res.status(500).json({ status: "error", message: error.message });
