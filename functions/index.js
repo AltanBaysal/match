@@ -156,7 +156,7 @@ exports.createRandomUsers = onRequest(async (req, res) => {
             const age = Math.floor(Math.random() * 38) + 18;
             const gender = genders[Math.floor(Math.random() * genders.length)];
             const educationKeys = Object.keys(educationLevels);
-            
+
             let interestedIn = [];
             const orientationRoll = Math.random();
             if (orientationRoll < 0.85) { // %85 heteroseksüel
@@ -235,10 +235,13 @@ exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, asyn
                 const centerGeohash = ngeohash.encode(uA.location.lat, uA.location.lon, precision);
                 const [start, end] = [centerGeohash, centerGeohash + '~'];
 
-                let candidatesQuery = db.collection('users')
+                 let candidatesQuery = db.collection('users')
                     .where('geohash', '>=', start)
                     .where('geohash', '<=', end)
+                    .where('age', '>=', minAge)    
+                    .where('age', '<=', maxAge)     
                     .where('gender', 'in', uA.interestedIn);
+
 
                 const candidatesSnapshot = await candidatesQuery.get();
                 if (candidatesSnapshot.empty) return;
@@ -330,7 +333,7 @@ exports.createFinalCouples = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, 
                 }
             }
         });
-        
+
         console.log(`Havuzlar (MVP): Hetero Erkek=${heteroMen.size}, Hetero Kadın=${heteroWomen.size}, Gey Erkek=${gayMen.size}, Lezbiyen Kadın=${lesbianWomen.size}`);
 
         const heteroEngagements = runStableMatching(heteroMen, heteroWomen, preferences);
