@@ -202,7 +202,7 @@ exports.createRandomUsers = onRequest(async (req, res) => {
 });
 
 
-exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, async (req, res) => {
+exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, async (req, res) => {
     try {
         const today = new Date();
         const dateDocumentId = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
@@ -284,7 +284,7 @@ exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, asyn
 });
 
 
-exports.createFinalCouples = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, async (req, res) => {
+exports.createFinalCouples = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, async (req, res) => {
     try {
         const today = new Date();
         const dateDocumentId = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
