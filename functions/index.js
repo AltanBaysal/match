@@ -165,7 +165,6 @@ function calculateScore(scorer, target) {
 
 // --- Cloud Functions ---
 
-// createRandomUsers fonksiyonu doğru, değişiklik yok.
 exports.createRandomUsers = onRequest(async (req, res) => {
     try {
         let count = parseInt(req.query.count) || 10;
@@ -225,7 +224,6 @@ exports.createRandomUsers = onRequest(async (req, res) => {
     }
 });
 
-// ✅✅✅ BU FONKSİYON TAMAMEN YENİLENDİ ✅✅✅
 exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, async (req, res) => {
     try {
         const today = new Date();
@@ -284,7 +282,6 @@ exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, asyn
                     }
                 });
             });
-            // --- ✅ DÜZELTME SONU ---
 
             for (const docB of potentialMatchesDocs) {
                 const uB = { id: docB.id, ...docB.data() };
@@ -323,7 +320,6 @@ exports.processMatches = onRequest({ timeoutSeconds: 540, memory: '1GiB' }, asyn
 });
 
 
-// createCouplesFromMatches fonksiyonu doğru, değişiklik yok.
 exports.createCouplesFromMatches = onRequest({ timeoutSeconds: 300, memory: '1GiB' }, async (req, res) => {
     try {
         const today = new Date();
