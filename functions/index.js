@@ -131,6 +131,8 @@ function calculateScore(scorer, target) {
     return Math.round(Math.max(0, score));
 }
 
+
+
 // --- Cloud Functions ---
 
 exports.createRandomUsers = onRequest(async (req, res) => {
@@ -376,9 +378,6 @@ exports.createFinalCouples = onRequest({ timeoutSeconds: 540, memory: '2GiB' }, 
 });
 
 
-/**
- * Tekrar kullanılabilir Gale-Shapley Algoritma Fonksiyonu
- */
 function runStableMatching(proposers, reviewers, allPreferences) {
     const engagements = new Map();
     if (proposers.size === 0 || reviewers.size === 0) return engagements;
